@@ -16,6 +16,7 @@ import difflib
 import importlib
 import importlib.metadata
 import inspect
+import os
 import re
 import sys
 import textwrap
@@ -125,6 +126,8 @@ class Environment:
             sub = self.module(f"{obj.__name__}.{name}")
             if sub is not None:
                 return sub
+            if name in stub_names(obj):
+                return UNKNOWN
         return MISSING
 
     def label(self, module_name: str) -> str:
@@ -141,6 +144,32 @@ class Environment:
             except importlib.metadata.PackageNotFoundError:
                 pass
         return top
+
+
+_stub_cache: dict[str, set[str]] = {}
+
+
+def stub_names(module) -> set[str]:
+    """Names a module's .pyi stub declares. They exist at runtime even when the module fills them
+    in later: alembic.context gets `config` when a migration runs."""
+    file = getattr(module, "__file__", None)
+    if not isinstance(file, str) or not file.endswith(".py"):
+        return set()
+    if file not in _stub_cache:
+        try:
+            tree = ast.parse(Path(file + "i").read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            tree = None
+        names = set()
+        for node in tree.body if tree else ():
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+            elif isinstance(node, ast.Assign):
+                names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+        _stub_cache[file] = names
+    return _stub_cache[file]
 
 
 def packages_distributions() -> dict[str, list[str]]:
@@ -217,7 +246,9 @@ def _deprecation_note(obj) -> str | None:
         own = {}
     note = own.get("__deprecated__")
     if isinstance(note, str):
-        return note or "deprecated"
+        # torch: `current_device_idx = deprecated("Use `current_device_index` instead")(current_device_index)`
+        # marks the function itself, so the replacement looks deprecated too.
+        return None if recommends_itself(obj, note) else note or "deprecated"
     doc = own.get("__doc__") if inspect.isclass(obj) else getattr(obj, "__doc__", None)
     if not isinstance(doc, str):
         return None
@@ -247,6 +278,10 @@ def _deprecation_note(obj) -> str | None:
             # Real notes say what to do instead, or nothing beyond the version.
             if not re.fullmatch(r"[\d.]*", note) and not DEPRECATION_SIGNAL.search(note):
                 return None
+            # sympy: "Using ``integrate()`` with Poly is deprecated", "``sympify(obj)`` falls back to
+            # ``str(obj)`` ... but this is deprecated" - one way of using it, not the object.
+            if BEHAVIOUR_NOTE.search(note) or recommends_itself(obj, note):
+                return None
             return note
     return None
 
@@ -255,6 +290,26 @@ DEPRECATION_SIGNAL = re.compile(
     r"remov|instead|in favou?r of|available as|legacy|should not be used|obsolete|replac|supersed"
     r"|no longer|not recommended|\buse\b|\b(is|are|has been|have been) deprecated|deprecated (since|in|and)",
     re.I)
+
+
+BEHAVIOUR_NOTE = re.compile(r"^[\d.]*\s*[A-Z][a-z]+ing\b[^.]*\bwith\b|\bfalls? back\b|\bthis (behaviou?r )?is deprecated",
+                            re.I)
+
+
+def recommends_itself(obj, note: str) -> bool:
+    """The note names the object as the replacement: it's about an alias of it. ("Use
+    ``newmod.func`` instead" on oldmod.func is a real move, so a qualifier must match.)"""
+    name = getattr(obj, "__name__", None)
+    if not isinstance(name, str) or not name.isidentifier():
+        return False
+    for m in re.finditer(rf"\b(?:use|in favou?r of)\s+(\S*?)\b{re.escape(name)}\b", note, re.I):
+        qualifier = re.split(r"[`:~]", m.group(1))[-1].strip(".")
+        if not qualifier:
+            return True
+        own = f"{owner_module(obj)}.{getattr(obj, '__qualname__', name)}"
+        if f"{qualifier}.{name}" in own:
+            return True
+    return False
 
 
 def quotes_a_parameter(obj, note: str) -> bool:
@@ -283,7 +338,8 @@ def moved_to(owner, name: str, what: str) -> str:
             continue
         try:
             sub = getattr(owner, attr, None)
-            if inspect.ismodule(sub) and sub.__name__ == f"{owner.__name__}.{attr}" and hasattr(sub, name):
+            if (inspect.ismodule(sub) and sub.__name__ == f"{owner.__name__}.{attr}" and not is_runtime_namespace(sub)
+                    and hasattr(sub, name)):
                 return f" Did you mean '{what}.{attr}.{name}'?"
         except Exception:  # lazy attributes import on access (six.moves.tkinter without Tk)
             continue
@@ -319,6 +375,49 @@ def custom_hook(cls, hook: str) -> bool:
 def is_proxy(cls) -> bool:
     """__getattribute__ overrides every lookup (super, proxies), so the class tells us nothing."""
     return custom_hook(cls, "__getattribute__")
+
+
+def is_runtime_namespace(module) -> bool:
+    """A module-like object no file defines, filled in at runtime: `torch.ops.fbgemm` gets its
+    operators when fbgemm_gpu loads. (Lazy-loading packages like transformers have a __spec__;
+    wrappers like cryptography's deprecation proxy around OpenSSL.crypto pass on a real __file__.)"""
+    if getattr(module, "__spec__", None) is not None or not custom_hook(type(module), "__getattr__"):
+        return False
+    try:
+        file = getattr(module, "__file__", None)
+    except Exception:
+        file = None
+    return not (isinstance(file, str) and os.path.isfile(file))
+
+
+_placeholder_cache: dict = {}
+
+
+def is_placeholder(func) -> bool:
+    """A base-class hook subclasses replace: abstract, or only raising NotImplementedError
+    (nn.Module.forward). Its signature says nothing about the subclass the call reaches."""
+    try:
+        if getattr(func, "__isabstractmethod__", False):
+            return True
+        return _placeholder_cache[func]
+    except (KeyError, TypeError):
+        pass
+    except Exception:  # live proxies raise when inspected
+        return False
+    result = False
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    except Exception:  # no source (C, builtins), or an object that raises when inspected
+        tree = None
+    if tree and tree.body and isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+        body = [s for s in tree.body[0].body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+        result = (len(body) == 1 and isinstance(body[0], ast.Raise) and body[0].exc is not None
+                  and "NotImplementedError" in ast.unparse(body[0].exc))
+    try:
+        _placeholder_cache[func] = result
+    except TypeError:
+        pass
+    return result
 
 
 def on_self(node: ast.AST) -> bool:
@@ -405,6 +504,18 @@ def _instance_attrs(cls):
     return names, False
 
 
+def accepts_any_keyword(cls) -> bool:
+    """Whether the class's own __init__ (not pydantic's) takes **kwargs."""
+    owner = next((c for c in mro_without_object(cls) if "__init__" in vars(c)), None)
+    if owner is None or owner.__module__.split(".")[0] in ("pydantic", "pydantic_core", "builtins"):
+        return False
+    try:
+        params = inspect.signature(vars(owner)["__init__"]).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+
+
 def bind(cls, attr: str, value):
     """What `instance.attr` gives: a bound method, a property's annotated type, or unknown."""
     raw = next((vars(c)[attr] for c in getattr(cls, "__mro__", ()) if attr in vars(c)), MISSING)
@@ -461,7 +572,15 @@ def is_feature_probe(test: ast.AST, flags: set[str] = frozenset()) -> bool:
     for n in ast.walk(test):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("hasattr", "getattr"):
             return True
-        if isinstance(n, ast.Name) and n.id in flags | {"TYPE_CHECKING"}:
+        # `if is_torch_npu_available(): torch.npu...` - backends that plugins add at runtime.
+        if isinstance(n, ast.Call) and AVAILABILITY_CHECK.fullmatch(decorator_name(n.func)):
+            return True
+        # `if "_arg2scope" in cs_fields:` - anyio picks the CallSpec fields of the pytest it runs on.
+        if (isinstance(n, ast.Compare) and isinstance(n.left, ast.Constant) and isinstance(n.left.value, str)
+                and n.left.value.isidentifier() and any(isinstance(op, (ast.In, ast.NotIn)) for op in n.ops)
+                and any(lists_members(c) for c in n.comparators)):
+            return True
+        if isinstance(n, ast.Name) and (n.id in flags or n.id == "TYPE_CHECKING"):
             return True
         if isinstance(n, ast.Attribute) and n.attr in flags:
             return True
@@ -475,6 +594,20 @@ def is_feature_probe(test: ast.AST, flags: set[str] = frozenset()) -> bool:
         # Library version checks: `np_version >= parse_version("1.25")`, `_vers >= (2,)`,
         # `werkzeug_major < 2`...
         if isinstance(n, ast.Compare) and any(is_version_operand(o) for o in (n.left, *n.comparators)):
+            return True
+    return False
+
+
+AVAILABILITY_CHECK = re.compile(r"\w*_?(available|installed|supported)|has_\w+")
+MEMBER_WORDS = {"fields", "field", "attrs", "attributes", "dir", "vars", "dict", "params", "parameters",
+                "signature", "sig", "members", "annotations"}
+
+
+def lists_members(node: ast.AST) -> bool:
+    """`cs_fields`, `dir(obj)`, `sig.parameters`, `cls.__dict__`: the names an API has."""
+    for v in ast.walk(node):
+        name = (getattr(v, "id", None) or getattr(v, "attr", None) or "").lower()
+        if MEMBER_WORDS & set(name.split("_")):
             return True
     return False
 
@@ -523,8 +656,11 @@ def feature_flags(tree: ast.Module) -> set[str]:
                     flags |= {t.id for t in node.targets if isinstance(t, ast.Name)}
     while True:
         found = set()
+        remaining = []
         for node in assigns:
-            if is_feature_probe(node.value, flags):
+            if not is_feature_probe(node.value, flags):
+                remaining.append(node)
+            else:
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for t in targets:
                     if isinstance(t, ast.Name):
@@ -534,6 +670,7 @@ def feature_flags(tree: ast.Module) -> set[str]:
         if found <= flags:
             return flags
         flags |= found
+        assigns = remaining  # an assignment already counted as a probe stays one
 
 
 def guarded_nodes(tree: ast.Module) -> set[ast.AST]:
@@ -558,9 +695,43 @@ def guarded_nodes(tree: ast.Module) -> set[ast.AST]:
                 if FALLBACK_ERRORS & {getattr(t, "id", None) or getattr(t, "attr", None)
                                       for t in (ast.walk(handler.type) if handler.type else ())}:
                     guarded.update(ast.walk(handler))
+    # `if hasattr(Shard, "new"): return Shard.new(...)` then `return Shard._old(...)`: what follows
+    # an early exit on a probe is the fallback for the other versions.
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(node, field, None)
+            if not isinstance(stmts, list):
+                continue
+            for i, stmt in enumerate(stmts):
+                if (isinstance(stmt, ast.If) and not stmt.orelse and is_feature_probe(stmt.test, flags)
+                        and isinstance(stmt.body[-1], (ast.Return, ast.Raise, ast.Continue, ast.Break))):
+                    # `if not hasattr(encoding, "C"): raise TypeError` checks an argument, not the
+                    # environment: after a hasattr exit only the probed object's uses are fallbacks.
+                    probed = probed_objects(stmt.test)
+                    for rest in stmts[i + 1:]:
+                        for n in ast.walk(rest):
+                            if not probed or (isinstance(n, (ast.Attribute, ast.Call)) and uses_any(n, probed)):
+                                guarded.update(ast.walk(n))
+                    break
     for func in import_hints(tree):
         guarded.update(ast.walk(func))
     return guarded
+
+
+def probed_objects(test: ast.AST) -> set[str]:
+    """The objects a condition's hasattr/getattr calls look at: `hasattr(Shard, "x")` -> {"Shard"}."""
+    return {ast.unparse(n.args[0]) for n in ast.walk(test)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("hasattr", "getattr")
+            and n.args}
+
+
+def uses_any(node: ast.AST, objects: set[str]) -> bool:
+    """`Shard._old(...)` or `Shard._old` uses Shard."""
+    target = node.func if isinstance(node, ast.Call) else node
+    if not isinstance(target, ast.Attribute):
+        return False
+    base = ast.unparse(target.value)
+    return any(base == o or base.startswith(o + ".") for o in objects)
 
 
 def import_hints(tree: ast.Module) -> list[ast.FunctionDef]:
@@ -627,6 +798,8 @@ class FileChecker(ast.NodeVisitor):
         self.local = local
         self.tree = ast.parse(source, filename=path)
         self.bindings: dict[str, object] = {}
+        self.imported: dict[tuple[int, str], object] = {}  # (import node, name) -> what it binds
+        self.in_functions: set[int] = set()
         self.local_classes: dict[str, LocalClass] = {}
         self.scopes: list[dict] = []
         self.class_stack: list[LocalClass | None] = []
@@ -640,6 +813,10 @@ class FileChecker(ast.NodeVisitor):
         self._seen: set[tuple] = set()
 
     def run(self) -> list[Finding]:
+        # An import inside a function binds the name there only: torch/_numpy imports
+        # `torch._numpy as np` at the top and `numpy as np` inside a few functions.
+        self.in_functions = {id(n) for f in ast.walk(self.tree) if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                             for n in ast.walk(f) if n is not f}
         for node in ast.walk(self.tree):
             if isinstance(node, ast.Import):
                 self.check_import(node, node in self.guarded)
@@ -713,12 +890,17 @@ class FileChecker(ast.NodeVisitor):
             if mod is UNKNOWN:
                 continue
             if alias.asname:
-                self.bindings[alias.asname] = mod
+                self.bind_import(node, alias.asname, mod)
             else:
                 top = alias.name.split(".")[0]
                 top_mod = self.env.module(top)
                 if top_mod is not None and top_mod is not UNKNOWN:
-                    self.bindings[top] = top_mod
+                    self.bind_import(node, top, top_mod)
+
+    def bind_import(self, node: ast.AST, name: str, value):
+        self.imported[(id(node), name)] = value
+        if id(node) not in self.in_functions:
+            self.bindings[name] = value
 
     def check_import_from(self, node: ast.ImportFrom, guarded: bool):
         if node.level or not node.module or self.is_local(node.module):
@@ -741,7 +923,7 @@ class FileChecker(ast.NodeVisitor):
                     self.report_missing_member(node, mod, alias.name, value, node.module)
                 continue
             self.check_deprecated(node, value, f"{node.module}.{alias.name}")
-            self.bindings[alias.asname or alias.name] = value
+            self.bind_import(node, alias.asname or alias.name, value)
 
     # -- classes defined in this file -----------------------------------------------------
 
@@ -876,7 +1058,12 @@ class FileChecker(ast.NodeVisitor):
                 for alias in node.names:
                     name = alias.asname or alias.name.split(".")[0]
                     if name != "*":
-                        sources[name].append(self.bindings.get(name, UNTYPED))
+                        # A name the file also binds another way isn't tracked (see run()).
+                        tracked = name not in self.stores
+                        # An import that failed (`except ImportError: import click._bashcomplete`)
+                        # leaves the name as the module level binds it.
+                        value = self.imported.get((id(node), name), self.bindings.get(name, UNTYPED))
+                        sources[name].append(value if tracked else UNTYPED)
             elif isinstance(node, (ast.Global, ast.Nonlocal)):
                 for name in node.names:
                     sources[name].append(UNTYPED)
@@ -969,6 +1156,8 @@ class FileChecker(ast.NodeVisitor):
         if inspect.ismodule(base) or inspect.isclass(base):
             value = self.env.member(base, attr)
             if value is UNKNOWN:
+                return None
+            if value is MISSING and inspect.ismodule(base) and is_runtime_namespace(base):
                 return None
             if value is MISSING or type(value) is Removed:
                 self.report_missing_member(expr, base, attr, value, ast.unparse(expr.value))
@@ -1077,11 +1266,22 @@ class FileChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def check_call(self, node: ast.Call, func, drop_first: bool = False):
+        if is_placeholder(func):
+            return
         try:
             sig = inspect.signature(func)
         except Exception:
             return
         params = list(sig.parameters.values())
+        if inspect.isclass(func):
+            # Compiled classes can report their __init__'s signature, self included: tokenizers'
+            # `decoders.ByteLevel` says `(self)` and takes keywords. Not one we can trust.
+            if params and params[0].name == "self":
+                return
+            # pydantic builds the signature from the fields, but a model's own `__init__(**data)`
+            # may take more: llama-index's Document(text=...) maps text to text_resource.
+            if getattr(func, "__signature__", None) is not None and accepts_any_keyword(func):
+                params.append(inspect.Parameter("kwargs", inspect.Parameter.VAR_KEYWORD))
         if drop_first:
             if params and params[0].kind in (inspect.Parameter.POSITIONAL_ONLY,
                                              inspect.Parameter.POSITIONAL_OR_KEYWORD):

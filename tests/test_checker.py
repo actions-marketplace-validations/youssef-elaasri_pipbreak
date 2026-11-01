@@ -428,6 +428,52 @@ class Deprecations(unittest.TestCase):
                     pass
 
             proxy = _Proxy()
+
+            def current_index(): pass
+            current_idx = deprecated("Use `current_index` instead")(current_index)
+
+            @deprecated("Use ``newlib.relocated`` instead")
+            def relocated(): pass
+
+            def sympify(a, strict=False):
+                """Convert.
+
+                .. deprecated:: 1.6
+                   ``sympify(obj)`` automatically falls back to ``str(obj)`` when all other
+                   conversion methods fail, but this is deprecated.
+                """
+
+            def integrate(f):
+                """Integrate.
+
+                .. deprecated:: 1.6
+                   Using ``integrate()`` with Poly is deprecated. Use Poly.integrate instead.
+                """
+
+            class Module:
+                def forward(self, *input):
+                    raise NotImplementedError("subclasses define forward")
+
+            def export() -> Module:
+                return Module()
+
+            import inspect, types
+            class Document:
+                def __init__(self, **data): pass
+            Document.__signature__ = inspect.Signature(
+                [inspect.Parameter("id_", inspect.Parameter.KEYWORD_ONLY)])
+            class Strict:
+                def __init__(self, id_=None): pass
+            Strict.__signature__ = inspect.Signature(
+                [inspect.Parameter("id_", inspect.Parameter.KEYWORD_ONLY)])
+            class Compiled:
+                __signature__ = inspect.Signature(
+                    [inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD)])
+
+            class _Namespace(types.ModuleType):
+                def __getattr__(self, name):
+                    raise AttributeError(name)
+            ops = _Namespace("oldlib.ops")
         '''))
         sys.path.insert(0, cls.tmp.name)
 
@@ -486,6 +532,49 @@ class Deprecations(unittest.TestCase):
         """
         self.assertEqual(codes(source), ["API101"])
 
+    def test_deprecated_alias_wrapping_the_real_function(self):
+        # torch: current_device_idx = deprecated("Use `current_device_index`")(current_device_index)
+        self.assertEqual(codes("from oldlib import current_index\n"), [])
+        self.assertEqual(codes("from oldlib import relocated\n"), ["API101"])
+
+    def test_deprecated_behaviour_is_not_a_deprecated_function(self):
+        self.assertEqual(codes("from oldlib import sympify, integrate\n"), [])
+
+    def test_placeholder_methods_are_not_signature_checked(self):
+        # nn.Module.forward raises NotImplementedError; the subclass defines the real one
+        self.assertEqual(codes("import oldlib\noldlib.export().forward(input_ids=1)\n"), [])
+
+    def test_class_with_its_own_kwargs_init(self):
+        # pydantic's signature lists fields; llama-index's Document.__init__(**data) takes text=
+        self.assertEqual(codes("import oldlib\noldlib.Document(text='x')\n"), [])
+        self.assertEqual(codes("import oldlib\noldlib.Strict(text='x')\n"), ["API003"])
+
+    def test_compiled_class_signature_listing_self(self):
+        self.assertEqual(codes("import oldlib\noldlib.Compiled(add_prefix_space=True)\n"), [])
+
+    def test_name_declared_in_the_stub(self):
+        # alembic.context gets `config` when a migration runs; context.pyi declares it
+        Path(self.tmp.name, "stubbed.py").write_text("def configure(): pass\n")
+        Path(self.tmp.name, "stubbed.pyi").write_text("config: object\ndef configure() -> None: ...\n")
+        self.assertEqual(codes("import stubbed\nstubbed.config\nstubbed.nothere\n"), ["API002"])
+
+    def test_namespace_filled_at_runtime(self):
+        # torch.ops.fbgemm gets its operators when fbgemm_gpu loads
+        self.assertEqual(codes("import oldlib\noldlib.ops.f8f8bf16_rowwise(1)\n"), [])
+        # cryptography wraps OpenSSL.crypto in a deprecation proxy: still a real module
+        Path(self.tmp.name, "wrapped.py").write_text(textwrap.dedent('''
+            import sys, types
+            def kept(): pass
+            class _Proxy(types.ModuleType):
+                def __init__(self, module):
+                    super().__init__(module.__name__)
+                    self.__dict__["_module"] = module
+                def __getattr__(self, name):
+                    return getattr(self._module, name)
+            sys.modules[__name__] = _Proxy(sys.modules[__name__])
+        '''))
+        self.assertEqual(codes("import wrapped\nwrapped.kept()\nwrapped.X509Req()\n"), ["API002"])
+
 
 class VersionFallbacks(unittest.TestCase):
     def test_except_import_error_fallback(self):
@@ -517,6 +606,37 @@ class VersionFallbacks(unittest.TestCase):
         self.assertEqual(codes(hint + "_workaround_for_static_import_finders()\n"), ["API001"])
         self.assertEqual(codes(hint.replace("_workaround", "load") + "__all__ = ['load_for_static_import_finders']\n"),
                          ["API001"])
+
+    def test_availability_checks(self):
+        # transformers: `if is_torch_npu_available(): torch.npu...`, or an early return without it
+        source = ("import os\nif is_torch_npu_available():\n    os.npu.seed()\n"
+                  "def f():\n    if not is_torch_hpu_available():\n        return None\n    return os.hpu.count()\n")
+        self.assertEqual(codes(source), [])
+
+    def test_membership_in_an_api_listing(self):
+        # anyio: `if "_arg2scope" in cs_fields:` picks the pytest 8 or pytest 7 CallSpec
+        source = ("import os\nif '_arg2scope' in cs_fields:\n    os.path.newname()\n"
+                  "else:\n    os.path.oldname()\n")
+        self.assertEqual(codes(source), [])
+        self.assertEqual(codes("import os\nif 'x' in values:\n    os.path.oldname()\n"), ["API002"])
+
+    def test_fallback_after_hasattr_returns(self):
+        # transformers: try the new names with hasattr, then fall back to the old one
+        source = ("import os\ndef f():\n    if hasattr(os, 'newname'):\n        return os.newname()\n"
+                  "    return os.path.oldname()\n")
+        self.assertEqual(codes(source), [])
+        unguarded = "import os\ndef f(x):\n    if x:\n        return 1\n    return os.path.oldname()\n"
+        self.assertEqual(codes(unguarded), ["API002"])
+        # nltk: an argument check, then a real use of a removed API (numpy.NINF)
+        validation = ("import os\ndef f(encoding):\n    if not hasattr(encoding, 'C'):\n        raise TypeError()\n"
+                      "    return os.path.oldname()\n")
+        self.assertEqual(codes(validation), ["API002"])
+
+    def test_function_import_binds_only_in_the_function(self):
+        # torch/_numpy: `import torch._numpy as np` at the top, `import numpy as np` in a function
+        source = ("import json as mod\ndef a():\n    import os as mod\n    return mod.getcwd()\n"
+                  "def b():\n    return mod.loads('1')\n")
+        self.assertEqual(codes(source), [])
 
     def test_unrelated_except_still_checked(self):
         source = "try:\n    pass\nexcept ValueError:\n    from os import oldname\n"
