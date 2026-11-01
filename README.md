@@ -37,6 +37,26 @@ No configuration, no type stubs, zero dependencies. Python 3.10+.
 - **Real Dependabot PRs:** on 40 open-source bump PRs it caught the Werkzeug 3 breaks in Flask,
   Flask-Login and Flask-WTF in every PR that had them - including one whose CI passed
   ([study](research/UPGRADES.md)).
+- **Real apps:** on six open-source apps in their own environments, it found bugs that I reproduced
+  and reported:
+  - CTFd: pinned Flask-Migrate passes `head_only=` to alembic 1.16, which dropped it
+    ([CTFd#3147](https://github.com/CTFd/CTFd/issues/3147))
+  - redash: pysaml2 calls `X509Req`, which pyOpenSSL 26.3 removed
+    ([pysaml2#1048](https://github.com/IdentityPython/pysaml2/issues/1048))
+  - paperless-ngx: channels uses `timezone.utc`, which Django 5 removed
+    ([channels#2237](https://github.com/django/channels/issues/2237), fix in
+    [#2238](https://github.com/django/channels/pull/2238))
+  - paperless-ngx: nltk uses `numpy.NINF`, which NumPy 2 removed
+    ([nltk#4007](https://github.com/nltk/nltk/issues/4007), fix in
+    [#4008](https://github.com/nltk/nltk/pull/4008))
+  - paperless-ngx: two llama-index packages use APIs their own dependencies removed
+    ([#23871](https://github.com/run-llama/llama_index/issues/23871),
+    [#23872](https://github.com/run-llama/llama_index/issues/23872))
+  - pretix's own code: a call that turns a validation error into a 500
+    ([pretix#6722](https://github.com/pretix/pretix/issues/6722))
+
+  The other three apps were NetBox, FlaskBB and healthchecks. On paperless-ngx (17,000 files),
+  every one of the 8 errors it reports is a real API mismatch.
 - **What it can't see:** arguments forwarded through `**kwargs`, methods on objects whose type is
   only known at runtime, binary (C extension) incompatibilities, and behaviour changes behind an
   unchanged API. It complements your tests; it doesn't replace them.
@@ -88,7 +108,8 @@ python -m pipbreak.compare --base .venv-old/bin/python --head .venv/bin/python -
 ```
 
 - `--uses LIB` (repeatable; import or distribution name) narrows the check to packages that import
-  LIB. That takes seconds; a whole environment takes a minute or two.
+  LIB. That takes seconds. A whole environment takes a few minutes, or longer for big ones
+  (paperless-ngx, with 17,000 files, takes about 15).
 - Only calls from one distribution into another count. A package's own internals, the stdlib,
   missing optional extras, vendored copies and shipped test suites are skipped.
 - Exit code is 1 when there are errors (`--strict` makes warnings fail too).
