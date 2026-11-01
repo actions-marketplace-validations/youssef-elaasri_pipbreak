@@ -221,7 +221,7 @@ def distribution_of(dists: dict[str, list[str]], module_name: str) -> str | None
     for i in range(len(parts), 0, -1):
         candidates = dists.get(".".join(parts[:i]))
         if candidates and (len(candidates) == 1 or i == 1):
-            return candidates[0]
+            return min(candidates)  # not candidates[0]: their order is the filesystem's, so differs across OSes
     return None
 
 
@@ -847,6 +847,10 @@ class FileChecker(ast.NodeVisitor):
         if parent_mod is None or parent_mod is UNKNOWN:
             top = name.split(".")[0]
             self.report(node, "error", "API001", f"package '{top}' is not installed in this environment")
+        elif getattr(parent_mod, "__file__", None) is None and hasattr(parent_mod, "__path__"):
+            # A namespace package has no contents of its own: llama_index.llms.langchain is a separate
+            # distribution that isn't installed, not something llama-index-llms-openai removed.
+            self.report(node, "error", "API001", f"package '{name}' is not installed in this environment")
         else:
             hint = suggest(child, dir(parent_mod))
             self.report(node, "error", "API001",
