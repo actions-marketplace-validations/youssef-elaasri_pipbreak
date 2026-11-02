@@ -56,7 +56,7 @@ No configuration, no type stubs, zero dependencies. Python 3.10+.
     ([pretix#6722](https://github.com/pretix/pretix/issues/6722))
 
   The other three apps were NetBox, FlaskBB and healthchecks. On paperless-ngx (17,000 files),
-  every one of the 8 errors it reports is a real API mismatch.
+  every error it reports is a real API mismatch: 7 on Linux, plus one Windows-only on Windows.
 - **What it can't see:** arguments forwarded through `**kwargs`, methods on objects whose type is
   only known at runtime, binary (C extension) incompatibilities, and behaviour changes behind an
   unchanged API. It complements your tests; it doesn't replace them.
@@ -109,7 +109,7 @@ python -m pipbreak.compare --base .venv-old/bin/python --head .venv/bin/python -
 
 - `--uses LIB` (repeatable; import or distribution name) narrows the check to packages that import
   LIB. That takes seconds. A whole environment takes a few minutes, or longer for big ones
-  (paperless-ngx, with 17,000 files, takes about 15).
+  (paperless-ngx, with 17,000 files, takes 15 to 30).
 - Only calls from one distribution into another count. A package's own internals, the stdlib,
   missing optional extras, vendored copies and shipped test suites are skipped.
 - Exit code is 1 when there are errors (`--strict` makes warnings fail too).

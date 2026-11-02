@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from pipbreak import check_source, compare
-from pipbreak.checker import check_installed, check_paths, packages_distributions
+from pipbreak.checker import check_installed, check_paths, distribution_of, packages_distributions
 from pipbreak.cli import main
 
 
@@ -723,6 +723,10 @@ class InstalledPackages(unittest.TestCase):
         # Two distributions sharing a namespace package, like zope.event and zope.interface.
         install(site, "nsp-one", "1.0", {"nsp/one/__init__.py": "def here(): pass\n"})
         install(site, "nsp-two", "2.0", {"nsp/two/__init__.py": "import nsp.one\nnsp.one.gone()\n"})
+        # Like llama_index.llms.langchain: another piece of the namespace, an optional extra not installed.
+        install(site, "nsp-zed", "1.0", {
+            "nsp/zed/__init__.py": "import nsp.one\ndef f():\n    from nsp.absent import thing\n    return thing\n",
+        })
         install(site, "bystander", "1.0", {"bystander.py": "import os\nos.path.nope()\n"})
         install(site, "vendorer", "1.0", {
             "vendorer/__init__.py": "",
@@ -735,7 +739,7 @@ class InstalledPackages(unittest.TestCase):
     def tearDownClass(cls):
         sys.path.remove(cls.tmp.name)
         for name in ("libnew", "consumer", "consumer.helpers", "optional_extra", "bystander", "vendorer",
-                     "plugin_host", "plugin_host.plugins", "nsp", "nsp.one", "nsp.two"):
+                     "plugin_host", "plugin_host.plugins", "nsp", "nsp.one", "nsp.two", "nsp.zed"):
             sys.modules.pop(name, None)
         cls.tmp.cleanup()
 
@@ -752,6 +756,13 @@ class InstalledPackages(unittest.TestCase):
         [finding] = check_installed({"nsp.one"})[0]
         self.assertEqual(finding.path, "nsp/two/__init__.py")
         self.assertIn("in nsp-one==1.0", finding.message)  # not the namespace's other distribution
+
+    def test_uninstalled_piece_of_a_namespace_is_an_optional_extra(self):
+        findings = check_installed({"nsp.one"})[0]
+        self.assertEqual([f.path for f in findings], ["nsp/two/__init__.py"])
+
+    def test_shared_top_level_owner_does_not_depend_on_install_order(self):
+        self.assertEqual(distribution_of({"top": ["zed", "core"]}, "top.sub"), "core")
 
     def test_modules_found_without_top_level_txt(self):
         # flit-built wheels (Jinja2 3.1, Werkzeug 3) ship no top_level.txt; Python < 3.11 can't map them.
